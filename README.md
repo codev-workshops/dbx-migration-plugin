@@ -1,0 +1,152 @@
+# dbx-migration-factory (Devin plugin)
+
+Private, installable Devin plugin for Databricks migrations. What it is and how a migration runs:
+`OVERVIEW.md`. This file covers installation, the optional dialect skills, and the write-scope guard's policy file.
+
+The repo root *is* the plugin:
+
+```
+.devin-plugin/plugin.json   manifest (name, version, requiredPlugins -> official databricks plugin)
+AGENTS.md                   always-on guardrails
+hooks.json, hooks/          PreToolUse write-scope guard (fail closed, see below)
+skills/                     one directory per skill (manager and worker skills; see OVERVIEW.md)
+skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills
+skills-extra/               a second, optional plugin (dbx-migration-dialects); not loaded by this one
+```
+
+## Install (private repo is fine)
+
+A private repo works as-is: cloud sessions fetch it through the org's Git integration, and
+CLI users fetch with their own git credentials — so both just need read access to this repo.
+Make sure the Devin GitHub App installation includes this repo.
+
+**Org/enterprise-wide (recommended):** at Settings → Resources → Plugins, add to the managed
+manifest:
+
+```json
+{
+  "requiredPlugins": ["Cognition-Partner-Workshops/dbx-migration-plugin"]
+}
+```
+
+Pin a version instead of tracking the default branch:
+
+```json
+{
+  "requiredPlugins": [
+    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.6.0" }
+  ]
+}
+```
+
+**Per user (CLI):**
+
+```bash
+devin plugins install Cognition-Partner-Workshops/dbx-migration-plugin
+```
+
+The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
+`.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
+plugin to, or installation fails with "Conflicting version pins"; when the org bumps its pin, bump
+this one in the same change. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
+`databricks/databricks-agent-skills` explicitly; transitive dependencies are not exempt.
+
+Databricks auth: see `skills/target-routing/SKILL.md`.
+
+## Optional dialect skills
+
+The core plugin ships only `oracle-plsql` as the example dialect. The other dialects live in `skills-extra/`, which
+is a separate plugin (`dbx-migration-dialects`) that the core manifest never loads; install it from
+`https://github.com/Cognition-Partner-Workshops/dbx-migration-plugin/tree/main/skills-extra` when an engagement needs one:
+
+- `teradata-bteq` — Teradata SQL, BTEQ, SPL stored procedures, TPT/MLOAD/FASTLOAD.
+- `informatica-xml` — Informatica PowerCenter XML exports.
+- `tsql-ssis` — SQL Server T-SQL (with Sybase ASE deltas) and SSIS packages.
+- `lakebridge` — Databricks Labs Lakebridge as an accelerator (never the merge gate).
+
+## Write-scope guard (`hooks/dbx_guard.py`)
+
+The PreToolUse hook recognises the client a shell command runs and lets only known read shapes
+through; everything else it recognises blocks. It is a no-op outside a workspace (no
+`.migration/allowed_targets.json` up the tree). The allowlist in force is the copy committed
+on the protected branch (`refs/remotes/origin/HEAD`, else `origin/main`/`origin/master`, else
+`HEAD`, else the working copy at bootstrap before any git history): a session may edit
+`.migration/` and open a PR, but a local edit never widens its own scope. Policy:
+
+```json
+{
+  "catalogs": ["migration_cat"],
+  "legacy_sources": ["LEGACY_DSN", "legacy-host.example"],
+  "guard_mode": "block",
+  "target_hosts": ["fixture-host", "LAKEBASE_MIGRATION_DSN"],
+  "bundle_targets": ["migration", "dev"],
+  "lakebase_projects": ["example-mig"],
+  "lakebase_branches": ["mig-*"],
+  "run_mode": "live",
+  "fixture_endpoints": ["AWS_ENDPOINT_URL"],
+  "forbidden_bundle_targets": ["prod", "production"]
+}
+```
+
+| key | required | meaning |
+|---|---|---|
+| `catalogs` | yes | Unity Catalog catalogs a Databricks write (`sql execute`, `spark-sql`, `tables delete mig_cat.s.t`, `fs rm dbfs:/Volumes/mig_cat/...`, `api delete .../tables/mig_cat.s.t`) may target; SQL is read from flags, positional text and positional `.sql` files alike. Also the catalog / database a generic-client write on a target host must resolve to (three-part name, `USE [CATALOG|DATABASE] x` before the write, else the one `-d`/`--dbname`/URI/conninfo database on the line or in a reconnect meta-command such as psql `\c db`, mysql `connect db`; two distinct databases resolve to none and block; `CREATE|DROP|ALTER DATABASE` and `GRANT ... ON DATABASE` always block). Also read by `dbx-recon`. |
+| `legacy_sources` | no | secret names, hosts, DSNs and profiles of the legacy estate. A generic SQL client whose command mentions one, and every legacy-only client (`bteq`, `sqlplus`, `snowsql`, ...), is held to read shapes only; loaders always block. |
+| `guard_mode` | no | `block` (default) or `warn` (approve with the reason attached). |
+| `target_hosts` | no | hosts / DSN names a generic SQL client (`psql`, `sqlcmd`, `isql`, `mysql`, ...) may run a non-read statement against. Every host candidate on the line (`-h`/`-S`/`--host`, `PGHOST=`, a positional or `-d` URI / conninfo) or in the script's reconnect meta-commands (psql `\c db user host`, `\c 'host=...'`, sqlcmd `:connect host`, mysql `connect db host`) must be a literal in the list, and there must be at least one; the write's container must still be in `catalogs`. **Missing or empty: every generic-client write blocks.** |
+| `bundle_targets` | no | targets `databricks bundle deploy\|run\|destroy` and `dbt run\|build\|seed` may use with a literal `-t/--target`. **Missing or empty: every deploy blocks.** |
+| `lakebase_projects` | no | Lakebase (Autoscaling Postgres) project ids a `databricks postgres` resource write (branch / endpoint / database / role / CDF) may target, under any branch except `production`; project lifecycle always blocks; `create-catalog` / `create-synced-table` are held to `catalogs`; reads and `generate-database-credential` pass. **Missing or empty: every Lakebase write blocks.** |
+| `lakebase_branches` | no | `fnmatch` globs for Lakebase branch ids that resource writes and branch references in Postgres catalog/synced-table JSON may target; `production` is always blocked. **Missing or empty: any non-`production` branch is allowed.** |
+| `run_mode` | no | `live` (default) or `fixture`; in fixture mode, naming a declared cloud family's CLI, SDK or URI scheme blocks unless every declared variable for that family is set in the hook environment. |
+| `fixture_endpoints` | no | Environment variable names whose family is identified by `AWS_`, `AZURE_`/`AZURITE_`, or `GOOGLE_`/`GCLOUD_`/`GCS_`/emulator prefixes, for example `["AWS_ENDPOINT_URL"]`. |
+| `forbidden_bundle_targets` | no | extra denylist on top of `bundle_targets`; default `["prod", "production"]`. |
+
+Always blocked regardless of config: `databricks` commands outside the read allowlist whose
+securable is not in `catalogs`, non-GET or bodied REST calls to a Databricks host, identity swaps
+(`auth login`, `--profile`, `DATABRICKS_TOKEN=`... around a Databricks client, writes to
+`.databrickscfg` / `~/.databricks/` / `~/.config/databricks/`, `auth token|env` which print the
+token), `EXPLAIN ANALYZE <write>` and side-effecting functions (`nextval`, `pg_terminate_backend`,
+`dblink`, `DBMS_*`, `OPENROWSET`, ...) and lock / transaction tokens that hold the source (`WITH (TABLOCKX|XLOCK|UPDLOCK|HOLDLOCK|SERIALIZABLE)`,
+`FOR UPDATE|SHARE`, `LOCKING ... FOR WRITE|EXCLUSIVE`, `SET TRANSACTION READ WRITE`) on a legacy source -- `SET TRANSACTION
+ISOLATION LEVEL <any>` / `READ ONLY`, `NOLOCK`-style hints and Teradata `LOCKING ... FOR ACCESS|READ` are reads --, edits to the running guard's own plugin tree, a program the guard has no rule for in front of a SQL
+client (`strace`, `chroot`, `firejail`, ...; `env`, `nice`, `nohup`, `timeout`, `sudo`, `ssh host`, `docker exec|run`, `kubectl exec` are modelled), and anything the guard cannot
+read (unreadable scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`, a relative script after a `cd` it cannot resolve). Remote executions on a legacy source through
+`ssh`, `docker exec`, `kubectl exec`, `aws ssm send-command`, or `az vm run-command invoke` are read through like direct commands and block for remote scripts or unreadable payloads. Every relative
+script or SQL file is read from the directory the command runs in (event `cwd`, `cd`, `pushd`, `env -C`, `git -C`). Python/JDBC/Spark programs are
+only cheaply inspected for literal SQL; the factory-doctor's read-only-principal row is the control
+for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row there to pin a new shape.
+
+**File-edit tools.** `hooks.json` has a second PreToolUse matcher, `^(edit|write|MultiEdit)$`, over the event's
+`tool_name`; the guard reads `tool_input.file_path` and its new content. Writes under `.migration/` are the
+session's working copy and pass, except that a session can never add a `legacy_write_authorized`, `gate_waived` or
+`merge_override` entry to `.migration/authorizations.json` (any edit or write whose added text carries one of those
+kinds blocks); authorizations enter only through a reviewed PR. Edits to the Databricks credential store and to the running guard's plugin tree block. This
+covers only file-edit tools the platform routes through PreToolUse under those names.
+
+**Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
+`DBX_DECISION=<id>` prefix (an assignment in front of the command; a flag, or the token inside the SQL, is not a prefix)
+matching an entry in the committed `.migration/authorizations.json` with that `id`, `kind: legacy_write_authorized`, a
+`by: user:...` author, and an `objects` list naming every object the statements write as a literal (a run-time
+substitution such as `$(TABLE)` never matches, and a statement whose object the guard cannot tell blocks). `guard_mode:
+warn` never downgrades an unauthorized legacy write. The file the guard reads is only the committed copy on the protected
+branch (`origin/HEAD`, else `origin/main`/`origin/master`, else local `HEAD`; never the working copy), so an unmerged entry
+never authorizes. The fan-out workflow resolves a wave manifest's waived-gate `decision_id`s and `merge_overrides`
+decisions the same way, against `gate_waived` / `merge_override` entries whose `objects` name the units, on the wave's
+base branch.
+
+## `.migration/` machine files
+
+| file | written by | read by |
+|---|---|---|
+| `.migration/allowed_targets.json` | `workspace-setup`, by reviewed PR | guard, factory-doctor, reconciliation harness |
+| `.migration/authorizations.json` | human by reviewed PR | guard, migration-fanout, factory-doctor |
+| `.migration/recon_tolerances.json` | `workspace-setup` | factory-doctor, reconciliation harness |
+| `.migration/capabilities.json` | factory-doctor | factory-doctor, wave-plan, migration-fanout |
+| `.migration/.hook_probe_nonce` | factory-doctor | factory-doctor |
+| `.migration/units/` (`dependencies.json`, `mapping_spec.json`) | pipeline analysis / dialect skill | wave-plan, factory-doctor, migration-fanout, reconciliation harness |
+| `.migration/waves/` (manifests, signatures, run records, results, current pointer) | wave-plan, migration-fanout | factory-doctor, migration-fanout, wave-verify |
+| `.migration/recon/` (unit reconciliation evidence) | unit-migration / reconciliation harness | wave-verify, migration-fanout, manager |
+| `.migration/snapshots/` (snapshot manifests) | snapshot/export workflow | reconciliation harness |
+
+Anything a human reads lives on the board (`plan.yaml` decisions/blockers/gates or ticket evidence),
+not in `.migration/`.
