@@ -1,3 +1,121 @@
+# 0.7.0 — slices, platform fences, parity-only merge authority
+
+Rewrite per `docs/design-0.7.md`. Safety moves to the migration principal's grants and branch
+protection; `hooks/guard.py` blocks only legacy-client writes, production deploy targets, credential-store
+edits and plugin-tree edits, and is silent outside a repo with `.migration/`. The unit of work is a
+consumer slice (`.migration/slices.json`, `tools/slices.py --check`, `tools/fanout.py`); `tools/doctor.py`
+runs six unsigned checks; `skills/recon` is the lifted harness with `parity: PASS|FAIL|NOT_RUN` as the
+only merge authority. Removed: the 0.6.2 phase skills, wave manifests, signed doctor records, hook
+nonce probes, authorizations, merge overrides, and `hooks/dbx_guard.py`. Devin never writes to the
+legacy source.
+
+# 0.6.2 — mixed-family estates run unpatched
+
+## Changed
+
+- Wave manifests refuse a declared gate `evidence` path that is not a file under
+  `.migration/recon/<one of the batch's units>/`, naming the allowed roots; a gate pointed at the
+  verifier's `.migration/recon/wave-<tag>/` made every child PR `protected_files_tampered` on lanes
+  whose parity passed.
+- migration-fanout passes a manifest's pinned `capabilities.http_path` to every child and verifier
+  `dbx-recon` run as `--target-http-path` (structural/degraded verification included) and validates its
+  shape, so recon reconciles on the warehouse the signed doctor record verified instead of falling back
+  to `DATABRICKS_HTTP_PATH`; undeclared is unchanged.
+- factory-doctor `--wave` audits the manifest's units (union of `batches[].units`) instead of every
+  spec under `.migration/units/`, so pipelines of different source families can share a workspace;
+  mapping specs may declare a top-level `family`, a mismatch with `--source-family` fails
+  `type_map_audit` and the other source rows, and every reusable row records `data.units` so a child
+  reuses a signed row only for units it covered.
+- data-reconciliation: the Databricks target reader sees Lakeflow `MATERIALIZED_VIEW` /
+  `STREAMING_TABLE` outputs (`table_kind`, recorded as `table_type`; `VIEW` and `FOREIGN` stay
+  absent), derives `rerun_posture: not_applicable(<kind>)` for a unit made only of them, and
+  records Unity Catalog's platform-inherent differences as `severity: info` findings that never
+  block — an unenforced PK whose key the target uniqueness probe proves unique, a pipeline
+  output's missing PK/identity, and a `grant_extra` for the run's own principal (`run
+  --capabilities`); gated on `--target-kind databricks`, Lakebase unchanged, duplicates and
+  every other grantee/grant_missing still block.
+- Merge overrides move out of the wave manifest into `.migration/authorizations.json`: a committed
+  `merge_override` entry names its `wave` (the manifest file stem) and the units in `objects`, with
+  optional `blocker_classes` (harness policy classes only; `data` is rejected). A manifest carrying
+  `merge_overrides` is refused, so authorizing an override keeps the `plan_sha` and the wave reruns
+  under its plan step. factory-doctor validates those entries, reads the authorization file from the
+  manifest's `base_branch`, parses the `grants get-effective` payload the CLI really returns
+  (`{privilege, inherited_from_type, ...}` items, recorded in `data.writable`), and accepts
+  `--source-attested` for a Databricks source only as a committed `source_principal_attested` entry
+  covering every in-scope table (row `warn`, never `ok`); dbx_guard blocks sessions adding that kind.
+- factory-doctor's session-identity connect (`dictionary_readable` on a Databricks-family source) no
+  longer passes `oauth_client_id/secret` to `databricks.sql.connect`, which the connector treats as
+  interactive U2M and waits on a browser for; it uses the recon harness's `credentials_provider`
+  (env-oidc mint inside the provider) with a socket timeout, verifies the warehouse with
+  `databricks warehouses get` before connecting (a deleted warehouse fails with
+  `DATABRICKS_HTTP_PATH names warehouse <id> which does not exist`), and takes `--http-path`
+  (recorded as `http_path`, signed; must equal a manifest's `capabilities.http_path` under `--wave`
+  and `--reuse-record`; a reused `dictionary_readable` row stands in only for the warehouse it was
+  probed on).
+  The harness's provider now returns a header factory, as the connector's `ExternalAuthProvider`
+  requires (it raised `'dict' object is not callable` on the first request).
+- Plan-chosen grading for target-only outputs: a mapping-spec object may carry
+  `"grading": "by_design_unverified"` (reject-only quarantine sinks, rollups). The harness keeps
+  target rows <= root rows and the structural tier (minus the root-key comparison; the target's own
+  key must be unique), skips the value tiers, records `grading` in
+  `result.json`, labels the object `unverified(by_design)`, and blocks the merge with reason
+  `by_design_unverified` (class `evidence`). The wave manifest batch declares the same objects in
+  `by_design_unverified` (in `plan_sha`); the launch halts when spec and manifest disagree, the batch
+  fails `grading_mismatch` when the results' set differs from the manifest's, and a matching
+  declaration is what clears the blocker.
+- migration-fanout's repo preflight compares the unexpanded `remote.origin.url` with the manifest's
+  `repo` when a `url.<target>.insteadOf` rewrite in `git config` maps it to the origin `git remote
+  get-url` reports, so a wave launches behind a git proxy; a proxy-shaped origin no configured
+  rewrite explains is compared as reported and still halts.
+- fanout/recon/skills: `unit-migration` states every guarded statement is a literal and a block is a halt; the DAB bundle name is `mig_<run_id>_<batch_id>` (target-routing text, literal in the fanout child brief); `DatabricksTargetAdapter` accepts a spec's `catalog.schema.table` only when it spells the adapter's own catalog and schema (case-insensitive, backticks stripped) and refuses two-part or foreign names with a `ConfigError`, Lakebase unchanged; `load_canon_rules` raises a `ConfigError` naming the path for an empty or non-object `profile.canon.json`, which `workspace-setup` now commits as `{"rules": []}` when a run has no rules.
+- migration-fanout's signed-doctor launch gate honours the manifest's plan-set `doctor_max_age`
+  (minutes; 15 when absent, as before) instead of a fixed 15-minute clock, so a wave whose plan allows a
+  30-minute record no longer re-signs it on every parent launch; a value that is not a positive integer
+  of at most 1440 halts the launch.
+
+## Fixed
+
+- `hooks/dbx_guard.py`: a `databricks postgres` JSON key containing `branch` whose value is a full
+  `projects/<p>/branches/<b>` path (what `create-synced-table` carries) was graded a second time
+  with the whole path as the branch id, so bare `lakebase_branches` globs like `mig-*` rejected it;
+  the reference match now grades it once by project and bare branch id. `workspace-setup`
+  pre-creates every declared `mig-*` branch and records its endpoint host in `target_hosts` in the
+  same PR; `intake` asks for the adjacent-session list.
+
+# 0.6.1 — waves launch without a hand-written pointer
+
+## Changed
+
+- The migration-fanout pointer moves from `.migration/waves/current.json` to
+  `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
+  every command. `workspace` is now required, and the old path (or a leftover `.migration/` beside
+  the new pointer outside a repo) is refused with a hint that deletes only empty directories.
+- A ready `doctor.py --wave` run (not `--role child`) writes that pointer itself, so a wave launches
+  without a hand-written one; a not-ready run writes none. `--wave` refuses a manifest outside
+  `<workspace>/.migration/waves/`.
+- Wave manifests and the doctor accept a wave's catalogs as a subset of the allowlist.
+- Qualified batch `write_targets` must sit in the wave's `capabilities.catalogs`.
+- Manifests refuse pre-0.6.0 fields by name and give the replacement or deletion.
+- Missing `plan_step` and overlong brief messages say what to change.
+- Oracle source DSN secrets may be JSON objects `{user|username, password, host, port,
+  service|service_name}`; factory-doctor and the recon harness share `recon/dsn.py`, so the
+  doctor cannot pass a form `dbx-recon run` rejects.
+- `workspace-setup` states the accepted source secret formats.
+- factory-doctor `type_map_audit` audits each unit mapping against its own top-level `target_kind`
+  (databricks|lakebase), falling back to `--target-kind`, so a run mixing Lakebase and Delta units
+  can reach one green doctor; a mixed audit records `target_kind: "mixed"` and is never reused by a child.
+- `factory-doctor`: setup probes `--source-secret` at principal level before mappings exist; table
+  grants remain per-unit.
+- `wave-plan/derive_waves.py` derives units, waves and batches from `dependencies.json` and the
+  unit mapping specs (`--batch-max`, default 5); `--check` verifies a hand-edited manifest against
+  the derivation. Wave 0 for dependency-free shared units is opt-in via `--shared-wave-0`.
+- `hooks/dbx_guard.py` classifies the invoked client instead of payload text, so reads pass when
+  `.migration/` has no allowlist yet; writes without a committed allowlist, invalid allowlists,
+  legacy writes and identity swaps still block. `hooks/tests/test_guard_clean_shipped.py` runs the
+  guard over every shipped command.
+- `hooks/dbx_guard.py`: the doctor's hook probe blocks from any shell, not only inside a workspace.
+- `hooks/dbx_guard.py`: read-only `databricks metastores current|summary` are allowed.
+
 # 0.6.0 — .migration/ holds machine files only
 
 0.5.0 moved the human-readable ledger onto the board but several skills still asked for prose
